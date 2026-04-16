@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
-"""Scan recent (past N days) X posts from a list of accounts without using X API.
+"""Scan recent X posts from target accounts without using the X API.
 
-Data sources:
-- Google search via opencli (public web)
-- Tweet page text via r.jina.ai (public HTML to text)
+Default pipeline:
+- Discover candidate post URLs via opencli's read-only X search adapter
+- Read post content via X's public oEmbed endpoint
 
-Outputs:
-- candidates.json: list of {url, handle, text, score, fetched_at}
-- candidates.md: quick skim markdown
-
-NOTE: This is a "collector" script. Final selection + Chinese rewrite is intended to be done by the agent using the skill workflow.
+Optional fallback backends:
+- syndication: public X timeline widget discovery fallback
+- r.jina.ai: text fetch fallback when oEmbed is insufficient
 """
 
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import html
 import json
 import re
+import shutil
 import subprocess
 import sys
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, List
 
 import requests
 
@@ -38,87 +39,160 @@ EXCLUDE_HINTS = [
     "pricing",
     "acquisition",
 ]
+DISCOVER_BACKENDS = ("opencli", "syndication")
+FETCH_BACKENDS = ("oembed", "jina")
+DEFAULT_TIMEOUT = 30
+STATUS_RE = re.compile(r"https?://(?:www\.)?(?:x|twitter)\.com/([^/]+)/status/(\d+)", re.IGNORECASE)
+STATUS_ID_RE = re.compile(
+    r"https?://(?:www\.)?(?:x|twitter)\.com/(?:[^/]+|i)/status/(\d+)", re.IGNORECASE
+)
+MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]+\)")
+MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+HTML_TAG_RE = re.compile(r"<[^>]+>")
+OEMBED_PARAGRAPH_RE = re.compile(r"<p\b[^>]*>(.*?)</p>", re.IGNORECASE | re.DOTALL)
+NEXT_DATA_RE = re.compile(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>')
+REPLY_COUNT_RE = re.compile(r"^Read \d+ replies$")
+ENGAGEMENT_RE = re.compile(r"^[\d.,]+[KMB]?$", re.IGNORECASE)
+READ_ONLY_OPENCLI_COMMANDS = {
+    ("twitter", "search"),
+}
 
 
-def run_opencli_google_search(query: str, limit: int = 20, lang: str = "en") -> List[Dict[str, Any]]:
-    cmd = [
-        "opencli",
-        "google",
-        "search",
-        "-f",
-        "json",
-        "--limit",
-        str(limit),
-        "--lang",
-        lang,
-        query,
-    ]
-    out = subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
-    data = json.loads(out)
-    if not isinstance(data, list):
-        return []
-    return data
+def log(message: str) -> None:
+    print(f"[ai-influence-digest] {message}", file=sys.stderr)
 
 
-STATUS_RE = re.compile(r"^https?://x\.com/([^/]+)/status/(\d+)")
+def command_exists(name: str) -> bool:
+    return shutil.which(name) is not None
 
 
-def extract_status_url(url: str) -> str | None:
-    if not url:
-        return None
-    m = STATUS_RE.match(url)
-    if not m:
-        return None
-    # Normalize to https
-    return f"https://x.com/{m.group(1)}/status/{m.group(2)}"
+def run_opencli_read_only(args: List[str]) -> str:
+    if len(args) < 3 or args[0] != "opencli":
+        raise ValueError("opencli command must start with: opencli <group> <command>")
+
+    command_key = (args[1], args[2])
+    if command_key not in READ_ONLY_OPENCLI_COMMANDS:
+        raise ValueError(f"unsafe opencli command blocked: {' '.join(args[:3])}")
+
+    proc = subprocess.run(args, text=True, capture_output=True, check=False)
+    output = proc.stdout
+    if proc.stderr:
+        output = f"{output}\n{proc.stderr}" if output else proc.stderr
+
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, args, output=output)
+    return output
 
 
-def fetch_tweet_text(status_url: str, timeout: int = 30) -> str:
-    # Use r.jina.ai to avoid login walls / heavy JS.
-    r = requests.get("https://r.jina.ai/" + status_url, timeout=timeout)
-    r.raise_for_status()
-    text = r.text
+def extract_first_json_value(raw: str) -> Any:
+    text = raw.lstrip()
+    if not text:
+        raise ValueError("empty output")
 
-    # Heuristic extraction: find "## Conversation" then take subsequent non-empty lines until "Quote" or "## New to X?".
-    idx = text.find("## Conversation")
-    if idx == -1:
-        idx = text.find("# Conversation")
-    body = text[idx:] if idx != -1 else text
+    decoder = json.JSONDecoder()
+    return decoder.raw_decode(text)[0]
 
-    lines = [ln.strip() for ln in body.splitlines()]
+
+def clean_extracted_text(text: str) -> str:
+    text = MARKDOWN_IMAGE_RE.sub("", text)
+    text = MARKDOWN_LINK_RE.sub(r"\1", text)
+
     out_lines: List[str] = []
-    started = False
-    for ln in lines:
-        if ln in ("## Conversation", "# Conversation"):
-            started = True
-            continue
-        if not started:
-            continue
-        if ln.startswith("Quote") or ln.startswith("## New to X") or ln.startswith("Sign up"):
-            break
-        # stop if we hit analytics/footer noise
-        if ln.startswith("[") and "Views" in ln:
-            break
-        if not ln:
-            # keep one blank at most
+    for raw_line in text.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
             if out_lines and out_lines[-1] != "":
                 out_lines.append("")
             continue
-        # skip UI noise
-        if ln.lower() in ("post", "conversation", "see new posts"):
+        if line.startswith(("Published Time:", "URL Source:", "Markdown Content:")):
             continue
-        out_lines.append(ln)
+        if line in ("[]",):
+            continue
+        if REPLY_COUNT_RE.match(line):
+            continue
+        if ENGAGEMENT_RE.match(line):
+            continue
+        if line.lower() in ("post", "conversation", "see new posts", "sign up"):
+            continue
+        out_lines.append(line)
+    return "\n".join(out_lines).strip()
 
-    cleaned = "\n".join(out_lines).strip()
-    # Fallback: if too short, return whole fetched text snippet
-    return cleaned if len(cleaned) >= 40 else cleaned
+
+def strip_html_fragment(fragment: str) -> str:
+    text = re.sub(r"<br\s*/?>", "\n", fragment, flags=re.IGNORECASE)
+    text = HTML_TAG_RE.sub("", text)
+    text = html.unescape(text).replace("\xa0", " ")
+    return clean_extracted_text(text)
+
+
+def normalize_status_url(url: str, preferred_handle: str | None = None) -> str | None:
+    match = STATUS_RE.search(url or "")
+    if match and match.group(1).lower() != "i":
+        return f"https://x.com/{match.group(1)}/status/{match.group(2)}"
+
+    id_match = STATUS_ID_RE.search(url or "")
+    if not id_match:
+        return None
+
+    if preferred_handle:
+        return f"https://x.com/{preferred_handle}/status/{id_match.group(1)}"
+    return f"https://x.com/i/status/{id_match.group(1)}"
+
+
+def extract_status_url(url: str, preferred_handle: str | None = None) -> str | None:
+    return normalize_status_url(url, preferred_handle=preferred_handle)
+
+
+def parse_dateish(value: str | None) -> dt.date | None:
+    if not value:
+        return None
+
+    text = html.unescape(value).strip()
+    text = re.sub(r"\s+", " ", text)
+    if not text:
+        return None
+
+    for fmt in (
+        "%Y-%m-%d",
+        "%B %d, %Y",
+        "%b %d, %Y",
+        "%I:%M %p · %b %d, %Y",
+        "%I:%M %p · %B %d, %Y",
+    ):
+        try:
+            return dt.datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+
+    try:
+        return parsedate_to_datetime(text).date()
+    except (TypeError, ValueError, IndexError):
+        pass
+
+    try:
+        return dt.datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def keyword_hint_regex() -> re.Pattern[str]:
+    return re.compile(r"\b(" + "|".join(re.escape(kw) for kw in KW) + r")\b", re.IGNORECASE)
+
+
+KW_HINT_RE = keyword_hint_regex()
+
+
+def looks_actionable(text: str) -> bool:
+    lowered = text.lower()
+    if KW_HINT_RE.search(text):
+        return True
+    return any(marker in lowered for marker in ("here's", "here is", "how to", "step-by-step"))
 
 
 def score_text(text: str) -> int:
     t = text.lower()
     score = 0
 
-    # Actionability cues
     if "here's" in t or "here is" in t:
         score += 3
     if re.search(r"\b\d\)\b|\b\d\.\b", t):
@@ -133,115 +207,533 @@ def score_text(text: str) -> int:
         score += 2
     if "how to" in t:
         score += 2
+    if "reposted" in t[:120]:
+        score -= 2
 
-    # Penalize infra/business noise
     for bad in EXCLUDE_HINTS:
         if bad in t:
             score -= 3
 
-    # length bonus (but cap)
     score += min(len(t) // 240, 3)
     return score
 
 
-def chunk(items: List[str], size: int) -> List[List[str]]:
-    return [items[i : i + size] for i in range(0, len(items), size)]
+def parse_syndication_timeline_html(html_text: str) -> Dict[str, Any]:
+    match = NEXT_DATA_RE.search(html_text)
+    if not match:
+        raise ValueError("syndication payload missing __NEXT_DATA__")
+    payload = json.loads(html.unescape(match.group(1)))
+    page_props = payload["props"]["pageProps"]
+    context = page_props.get("contextProvider") or {}
+    timeline = page_props.get("timeline") or {}
+    return {
+        "has_results": bool(context.get("hasResults")),
+        "entries": timeline.get("entries") or [],
+        "latest_tweet_id": timeline.get("latest_tweet_id"),
+    }
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--accounts", default=str(Path(__file__).resolve().parent.parent / "references/accounts_65.txt"))
-    ap.add_argument("--days", type=int, default=7)
-    ap.add_argument("--batch-size", type=int, default=10)
-    ap.add_argument("--per-search", type=int, default=20)
-    ap.add_argument("--outdir", default=str(Path.cwd() / "output"))
-    ap.add_argument("--lang", default="en")
-    args = ap.parse_args()
+def fetch_syndication_timeline(handle: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
+    response = requests.get(
+        f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{handle}",
+        params={"lang": "en", "showHeader": "true", "showReplies": "false", "transparent": "false"},
+        headers={"User-Agent": "ai-influence-digest/1.0"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return parse_syndication_timeline_html(response.text)
+
+
+def build_opencli_twitter_queries(handle: str, after: str) -> List[str]:
+    keyword_clause = " OR ".join(KW)
+    return [
+        f"from:{handle} ({keyword_clause}) since:{after}",
+        f"from:{handle} since:{after}",
+    ]
+
+
+def run_opencli_twitter_search(query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    if not command_exists("opencli"):
+        raise FileNotFoundError("opencli not found")
+
+    cmd = [
+        "opencli",
+        "twitter",
+        "search",
+        "--filter",
+        "live",
+        "-f",
+        "json",
+        "--limit",
+        str(limit),
+        query,
+    ]
+    try:
+        output = run_opencli_read_only(cmd)
+    except subprocess.CalledProcessError as exc:
+        if "No search results found" in (exc.output or ""):
+            return []
+        raise
+
+    data = extract_first_json_value(output)
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
+def discover_urls_syndication(
+    handles: List[str],
+    cutoff_date: dt.date,
+    timeout: int,
+    require_actionable: bool,
+) -> List[str]:
+    urls: List[str] = []
+    for idx, handle in enumerate(handles, 1):
+        try:
+            payload = fetch_syndication_timeline(handle, timeout=timeout)
+        except (requests.RequestException, ValueError) as exc:
+            log(f"warn: syndication user {idx}/{len(handles)} @{handle} failed: {exc}")
+            continue
+
+        entries = payload.get("entries") or []
+        user_hits = 0
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("type") != "tweet":
+                continue
+            content = entry.get("content") or {}
+            tweet = content.get("tweet") or {}
+            if not isinstance(tweet, dict):
+                continue
+            created_date = parse_dateish(str(tweet.get("created_at") or ""))
+            if created_date and created_date < cutoff_date:
+                continue
+            text = clean_extracted_text(str(tweet.get("full_text") or tweet.get("text") or ""))
+            if require_actionable and text and not looks_actionable(text):
+                continue
+            permalink = tweet.get("permalink")
+            if isinstance(permalink, str) and permalink.strip():
+                normalized = normalize_status_url("https://x.com" + permalink)
+                if normalized:
+                    urls.append(normalized)
+                    user_hits += 1
+        log(f"syndication user {idx}/{len(handles)} @{handle} -> {user_hits} urls")
+    return urls
+
+
+def discover_urls_opencli(
+    handles: List[str],
+    after: str,
+    _batch_size: int,
+    per_search: int,
+    _lang: str,
+    cutoff_date: dt.date,
+    require_actionable: bool,
+) -> List[str]:
+    urls: List[str] = []
+    for idx, handle in enumerate(handles, 1):
+        user_hits = 0
+        seen_for_user = set()
+        for query_index, query in enumerate(build_opencli_twitter_queries(handle, after), 1):
+            results = run_opencli_twitter_search(query, limit=per_search)
+            for result in results:
+                author = str(result.get("author") or "").strip()
+                normalized = extract_status_url(str(result.get("url", "")), preferred_handle=author or handle)
+                if not normalized:
+                    continue
+
+                match = STATUS_RE.search(normalized)
+                if not match or match.group(1).lower() != handle.lower():
+                    continue
+
+                created_date = parse_dateish(str(result.get("created_at") or ""))
+                if created_date and created_date < cutoff_date:
+                    continue
+
+                text = clean_extracted_text(str(result.get("text") or ""))
+                if require_actionable and text and not looks_actionable(text):
+                    continue
+
+                if normalized in seen_for_user:
+                    continue
+
+                seen_for_user.add(normalized)
+                urls.append(normalized)
+                user_hits += 1
+
+            log(f"opencli user {idx}/{len(handles)} @{handle} query#{query_index} -> {len(results)} results")
+
+            if user_hits >= per_search:
+                break
+
+        log(f"opencli user {idx}/{len(handles)} @{handle} -> {user_hits} urls")
+    return urls
+
+
+def minimum_auto_urls(handle_count: int, per_search: int) -> int:
+    return max(10, min(handle_count, per_search))
+
+
+def dedupe_urls(urls: Iterable[str]) -> List[str]:
+    seen = set()
+    unique: List[str] = []
+    for url in urls:
+        normalized = normalize_status_url(url)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(normalized)
+    return unique
+
+
+def discover_status_urls(
+    backend: str,
+    handles: List[str],
+    after: str,
+    cutoff_date: dt.date,
+    batch_size: int,
+    per_search: int,
+    lang: str,
+    timeout: int,
+    require_actionable: bool,
+) -> Dict[str, str]:
+    target_urls = minimum_auto_urls(len(handles), per_search)
+    discovered: Dict[str, str] = {}
+    backends = [backend] if backend != "auto" else list(DISCOVER_BACKENDS)
+
+    for name in backends:
+        try:
+            if name == "syndication":
+                urls = discover_urls_syndication(handles, cutoff_date, timeout, require_actionable=require_actionable)
+            elif name == "opencli":
+                urls = discover_urls_opencli(
+                    handles,
+                    after,
+                    batch_size,
+                    per_search,
+                    lang,
+                    cutoff_date,
+                    require_actionable=require_actionable,
+                )
+            else:
+                raise ValueError(f"unsupported discover backend: {name}")
+        except (FileNotFoundError, requests.RequestException, subprocess.CalledProcessError, ValueError) as exc:
+            log(f"warn: discover backend {name} failed: {exc}")
+            urls = []
+
+        before = len(discovered)
+        for url in dedupe_urls(urls):
+            discovered.setdefault(url, name)
+        added = len(discovered) - before
+        log(f"discover backend {name} added {added} urls (total={len(discovered)})")
+
+        if backend == "auto" and len(discovered) >= target_urls:
+            break
+
+    return discovered
+
+
+def parse_oembed_payload(payload: Dict[str, Any]) -> Dict[str, str | None]:
+    html_fragment = str(payload.get("html", "")).strip()
+    if not html_fragment:
+        raise ValueError("oEmbed response missing html")
+
+    paragraph_match = OEMBED_PARAGRAPH_RE.search(html_fragment)
+    if not paragraph_match:
+        raise ValueError("oEmbed html missing paragraph")
+
+    text = strip_html_fragment(paragraph_match.group(1))
+    if not text:
+        raise ValueError("oEmbed text extraction failed")
+
+    published_date = None
+    for anchor_text in reversed(re.findall(r"<a\b[^>]*>(.*?)</a>", html_fragment, flags=re.IGNORECASE | re.DOTALL)):
+        parsed = parse_dateish(strip_html_fragment(anchor_text))
+        if parsed:
+            published_date = parsed.isoformat()
+            break
+
+    return {
+        "text": text,
+        "author_name": str(payload.get("author_name") or "").strip() or None,
+        "published_date": published_date,
+        "canonical_url": normalize_status_url(str(payload.get("url") or "")),
+    }
+
+
+def fetch_tweet_oembed(status_url: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, str | None]:
+    response = requests.get(
+        "https://publish.x.com/oembed",
+        params={"url": status_url, "omit_script": "1"},
+        headers={"User-Agent": "ai-influence-digest/1.0"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("unexpected oEmbed payload")
+    info = parse_oembed_payload(payload)
+    info["backend"] = "oembed"
+    return info
+
+
+def extract_jina_text(raw_text: str) -> str:
+    idx = raw_text.find("## Conversation")
+    if idx == -1:
+        idx = raw_text.find("# Conversation")
+    body = raw_text[idx:] if idx != -1 else raw_text
+
+    lines = [line.strip() for line in body.splitlines()]
+    out_lines: List[str] = []
+    started = False
+    for line in lines:
+        if line in ("## Conversation", "# Conversation"):
+            started = True
+            continue
+        if not started and idx != -1:
+            continue
+        if line.startswith("Quote") or line.startswith("## New to X") or line.startswith("Sign up"):
+            break
+        if line.startswith("[") and "Views" in line:
+            break
+        if not line:
+            if out_lines and out_lines[-1] != "":
+                out_lines.append("")
+            continue
+        if line.lower() in ("post", "conversation", "see new posts"):
+            continue
+        out_lines.append(line)
+
+    cleaned = clean_extracted_text("\n".join(out_lines))
+    if len(cleaned) >= 40:
+        return cleaned
+
+    fallback_lines = []
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith(("Title:", "URL Source:", "Markdown Content:")):
+            continue
+        fallback_lines.append(stripped)
+        if len(" ".join(fallback_lines)) >= 800:
+            break
+    return clean_extracted_text("\n".join(fallback_lines))
+
+
+def fetch_tweet_jina(status_url: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, str | None]:
+    response = requests.get("https://r.jina.ai/" + status_url, timeout=timeout)
+    response.raise_for_status()
+    raw_text = response.text
+    text = extract_jina_text(raw_text)
+    if not text:
+        raise ValueError("jina text extraction failed")
+
+    published_date = None
+    for line in raw_text.splitlines():
+        if line.startswith("Published Time:"):
+            published_date = parse_dateish(line.split(":", 1)[1].strip())
+            break
+
+    return {
+        "text": text,
+        "author_name": None,
+        "published_date": published_date.isoformat() if published_date else None,
+        "canonical_url": status_url,
+        "backend": "jina",
+    }
+
+def fetch_tweet_info(status_url: str, backend: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, str | None]:
+    backends = [backend] if backend != "auto" else list(FETCH_BACKENDS)
+    errors: List[str] = []
+
+    for name in backends:
+        try:
+            if name == "oembed":
+                return fetch_tweet_oembed(status_url, timeout=timeout)
+            if name == "jina":
+                return fetch_tweet_jina(status_url, timeout=timeout)
+            raise ValueError(f"unsupported fetch backend: {name}")
+        except (FileNotFoundError, requests.RequestException, subprocess.CalledProcessError, ValueError) as exc:
+            errors.append(f"{name}: {exc}")
+            continue
+
+    raise RuntimeError("; ".join(errors) or "no fetch backends available")
+
+
+def load_handles(accounts_path: Path) -> List[str]:
+    handles: List[str] = []
+    for line in accounts_path.read_text("utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        handles.append(stripped.lstrip("@"))
+    return handles
+
+
+def load_seed_urls(seed_path: Path) -> Dict[str, str]:
+    discovered: Dict[str, str] = {}
+    for line in seed_path.read_text("utf-8").splitlines():
+        normalized = normalize_status_url(line.strip())
+        if normalized:
+            discovered[normalized] = "seed"
+    return discovered
+
+
+def render_candidates_markdown(
+    candidates: List[Dict[str, Any]],
+    days: int,
+    after: str,
+    accounts_count: int,
+) -> str:
+    lines = [
+        f"# X weekly candidates (last {days} days)",
+        f"- after: {after}",
+        f"- accounts: {accounts_count}",
+        f"- collected: {len(candidates)}",
+        "",
+    ]
+
+    for index, candidate in enumerate(candidates[:60], 1):
+        lines.append(f"## {index}. @{candidate['handle']} (score={candidate['score']})")
+        lines.append(candidate["url"])
+        lines.append("")
+        meta_bits = [
+            f"discovered_via={candidate['discover_backend']}",
+            f"fetched_via={candidate['fetch_backend']}",
+        ]
+        if candidate.get("published_date"):
+            meta_bits.append(f"published_date={candidate['published_date']}")
+        lines.append("- " + " | ".join(meta_bits))
+        lines.append("")
+        lines.append(candidate["text"][:800].strip())
+        lines.append("")
+
+    return "\n".join(lines) + "\n"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--accounts", default=str(Path(__file__).resolve().parent.parent / "references/accounts_65.txt"))
+    parser.add_argument("--seed-urls", default="", help="Optional file with known X status URLs, one per line.")
+    parser.add_argument("--days", type=int, default=7)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=10,
+        help="Legacy knob kept for CLI compatibility; current discover backends ignore it.",
+    )
+    parser.add_argument("--per-search", type=int, default=20)
+    parser.add_argument("--outdir", default=str(Path.cwd() / "output"))
+    parser.add_argument(
+        "--lang",
+        default="en",
+        help="Legacy knob kept for CLI compatibility; current discover backends ignore it.",
+    )
+    parser.add_argument(
+        "--discover-backend",
+        choices=("auto", "syndication", "opencli", "none"),
+        default="auto",
+    )
+    parser.add_argument(
+        "--fetch-backend",
+        choices=("auto", "oembed", "jina"),
+        default="auto",
+    )
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    parser.add_argument(
+        "--allow-non-actionable",
+        action="store_true",
+        help="Keep posts even when they do not match actionable keyword heuristics.",
+    )
+    args = parser.parse_args()
 
     accounts_path = Path(args.accounts).expanduser().resolve()
     if not accounts_path.exists():
         print(f"accounts file not found: {accounts_path}", file=sys.stderr)
         sys.exit(1)
 
-    handles = []
-    for ln in accounts_path.read_text("utf-8").splitlines():
-        ln = ln.strip()
-        if not ln or ln.startswith("#"):
-            continue
-        handles.append(ln.lstrip("@"))
-
+    handles = load_handles(accounts_path)
     today = dt.date.today()
-    after = (today - dt.timedelta(days=args.days)).isoformat()
+    cutoff_date = today - dt.timedelta(days=args.days)
+    after = cutoff_date.isoformat()
 
     outdir = Path(args.outdir).expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
 
-    urls = []
-    for batch in chunk(handles, args.batch_size):
-        sites = " OR ".join([f"site:x.com/{h}/status" for h in batch])
-        kws = " OR ".join(KW)
-        query = f"({sites}) ({kws}) after:{after}"
-        try:
-            results = run_opencli_google_search(query, limit=args.per_search, lang=args.lang)
-        except subprocess.CalledProcessError as e:
-            print(f"[warn] opencli search failed: {e}", file=sys.stderr)
-            continue
+    log(
+        f"starting scan: accounts={len(handles)} days={args.days} "
+        f"discover={args.discover_backend} fetch={args.fetch_backend} outdir={outdir}"
+    )
 
-        for r in results:
-            u = extract_status_url(str(r.get("url", "")))
-            if u:
-                urls.append(u)
-
-    # dedup preserve order
-    seen = set()
-    uniq_urls = []
-    for u in urls:
-        if u in seen:
-            continue
-        seen.add(u)
-        uniq_urls.append(u)
-
-    candidates = []
-    for u in uniq_urls:
-        m = STATUS_RE.match(u)
-        handle = m.group(1) if m else ""
-        try:
-            text = fetch_tweet_text(u)
-        except Exception as e:
-            print(f"[warn] fetch failed: {u} {e}", file=sys.stderr)
-            continue
-        if not text:
-            continue
-        s = score_text(text)
-        candidates.append(
-            {
-                "url": u,
-                "handle": handle,
-                "text": text,
-                "score": s,
-                "fetched_at": dt.datetime.now().isoformat(timespec="seconds"),
-            }
+    discovered_urls: Dict[str, str]
+    if args.seed_urls:
+        seed_path = Path(args.seed_urls).expanduser().resolve()
+        if not seed_path.exists():
+            print(f"seed urls file not found: {seed_path}", file=sys.stderr)
+            sys.exit(1)
+        discovered_urls = load_seed_urls(seed_path)
+        log(f"loaded {len(discovered_urls)} seed urls from {seed_path}")
+    elif args.discover_backend == "none":
+        print("discover-backend=none requires --seed-urls", file=sys.stderr)
+        sys.exit(1)
+    else:
+        discovered_urls = discover_status_urls(
+            backend=args.discover_backend,
+            handles=handles,
+            after=after,
+            cutoff_date=cutoff_date,
+            batch_size=args.batch_size,
+            per_search=args.per_search,
+            lang=args.lang,
+            timeout=args.timeout,
+            require_actionable=not args.allow_non_actionable,
         )
 
-    candidates.sort(key=lambda x: x.get("score", 0), reverse=True)
+    unique_urls = list(discovered_urls.keys())
+    log(f"deduped candidate urls: {len(unique_urls)}")
+
+    candidates: List[Dict[str, Any]] = []
+    for index, status_url in enumerate(unique_urls, 1):
+        try:
+            info = fetch_tweet_info(status_url, backend=args.fetch_backend, timeout=args.timeout)
+        except Exception as exc:  # pragma: no cover - runtime/network variability
+            log(f"warn: fetch failed {status_url} {exc}")
+            continue
+
+        text = str(info.get("text") or "").strip()
+        if not text:
+            continue
+
+        published_date = parse_dateish(str(info.get("published_date") or ""))
+        if published_date and published_date < cutoff_date:
+            continue
+
+        match = STATUS_RE.search(status_url)
+        handle = match.group(1) if match else ""
+        canonical_url = normalize_status_url(str(info.get("canonical_url") or status_url)) or status_url
+        candidate = {
+            "url": canonical_url,
+            "handle": handle,
+            "author_name": info.get("author_name"),
+            "text": text,
+            "score": score_text(text),
+            "discover_backend": discovered_urls.get(status_url, "seed"),
+            "fetch_backend": info.get("backend") or args.fetch_backend,
+            "published_date": published_date.isoformat() if published_date else None,
+            "fetched_at": dt.datetime.now().isoformat(timespec="seconds"),
+        }
+        candidates.append(candidate)
+
+        if index % 10 == 0 or index == len(unique_urls):
+            log(f"fetched {index}/{len(unique_urls)} urls, kept {len(candidates)} candidates")
+
+    candidates.sort(key=lambda item: item.get("score", 0), reverse=True)
 
     (outdir / "candidates.json").write_text(json.dumps(candidates, ensure_ascii=False, indent=2) + "\n", "utf-8")
-
-    md_lines = [
-        f"# X weekly candidates (last {args.days} days)",
-        f"- after: {after}",
-        f"- accounts: {len(handles)}",
-        f"- collected: {len(candidates)}",
-        "",
-    ]
-    for i, c in enumerate(candidates[:60], 1):
-        md_lines.append(f"## {i}. @{c['handle']} (score={c['score']})")
-        md_lines.append(c["url"])
-        md_lines.append("")
-        md_lines.append(c["text"][:800].strip())
-        md_lines.append("")
-
-    (outdir / "candidates.md").write_text("\n".join(md_lines) + "\n", "utf-8")
+    (outdir / "candidates.md").write_text(
+        render_candidates_markdown(candidates, days=args.days, after=after, accounts_count=len(handles)),
+        "utf-8",
+    )
 
     print(str(outdir / "candidates.json"))
 
