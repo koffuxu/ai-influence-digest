@@ -2,7 +2,7 @@
 """Scan recent X posts from target accounts without using the X API.
 
 Default pipeline:
-- Discover candidate post URLs via opencli's read-only X search adapter
+- Discover candidate post URLs via opencli's read-only Google search adapter
 - Read post content via X's public oEmbed endpoint
 
 Optional fallback backends:
@@ -39,7 +39,7 @@ EXCLUDE_HINTS = [
     "pricing",
     "acquisition",
 ]
-DISCOVER_BACKENDS = ("opencli", "syndication")
+DISCOVER_BACKENDS = ("opencli-google", "opencli-twitter", "syndication")
 FETCH_BACKENDS = ("oembed", "jina")
 DEFAULT_TIMEOUT = 30
 STATUS_RE = re.compile(r"https?://(?:www\.)?(?:x|twitter)\.com/([^/]+)/status/(\d+)", re.IGNORECASE)
@@ -55,6 +55,7 @@ REPLY_COUNT_RE = re.compile(r"^Read \d+ replies$")
 ENGAGEMENT_RE = re.compile(r"^[\d.,]+[KMB]?$", re.IGNORECASE)
 READ_ONLY_OPENCLI_COMMANDS = {
     ("twitter", "search"),
+    ("google", "search"),
 }
 
 
@@ -281,6 +282,40 @@ def run_opencli_twitter_search(query: str, limit: int = 20) -> List[Dict[str, An
     return [item for item in data if isinstance(item, dict)]
 
 
+def run_opencli_google_search(query: str, limit: int = 20, lang: str = "en") -> List[Dict[str, Any]]:
+    if not command_exists("opencli"):
+        raise FileNotFoundError("opencli not found")
+
+    cmd = [
+        "opencli",
+        "google",
+        "search",
+        "-f",
+        "json",
+        "--limit",
+        str(limit),
+        "--lang",
+        lang,
+        query,
+    ]
+    try:
+        output = run_opencli_read_only(cmd)
+    except subprocess.CalledProcessError as exc:
+        if "No search results found" in (exc.output or ""):
+            return []
+        raise
+    data = extract_first_json_value(output)
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict)]
+
+
+def chunk(items: List[str], size: int) -> List[List[str]]:
+    if size <= 0:
+        size = 1
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
 def discover_urls_syndication(
     handles: List[str],
     cutoff_date: dt.date,
@@ -369,6 +404,59 @@ def discover_urls_opencli(
     return urls
 
 
+def discover_urls_opencli_google(
+    handles: List[str],
+    after: str,
+    batch_size: int,
+    per_search: int,
+    lang: str,
+    _cutoff_date: dt.date,
+    require_actionable: bool,
+) -> List[str]:
+    urls: List[str] = []
+    for batch_index, handle_batch in enumerate(chunk(handles, batch_size), 1):
+        lower_handles = {handle.lower() for handle in handle_batch}
+        user_hits = 0
+        seen_for_batch = set()
+        sites = " OR ".join(f"site:x.com/{handle}/status" for handle in handle_batch)
+        keyword_clause = " OR ".join(KW)
+        queries = [
+            f"({sites}) ({keyword_clause}) after:{after}",
+            f"({sites}) after:{after}",
+        ]
+
+        for query_index, query in enumerate(queries, 1):
+            results = run_opencli_google_search(query, limit=per_search, lang=lang)
+            for result in results:
+                normalized = extract_status_url(str(result.get("url") or ""))
+                if not normalized:
+                    continue
+
+                match = STATUS_RE.search(normalized)
+                if not match or match.group(1).lower() not in lower_handles:
+                    continue
+
+                text = clean_extracted_text(
+                    f"{str(result.get('title') or '')}\n{str(result.get('snippet') or result.get('description') or '')}"
+                )
+                if require_actionable and text and not looks_actionable(text):
+                    continue
+
+                if normalized in seen_for_batch:
+                    continue
+
+                seen_for_batch.add(normalized)
+                urls.append(normalized)
+                user_hits += 1
+
+            log(f"google batch {batch_index} query#{query_index} -> {len(results)} results")
+            if user_hits >= per_search:
+                break
+
+        log(f"google batch {batch_index} handles={len(handle_batch)} -> {user_hits} urls")
+    return urls
+
+
 def minimum_auto_urls(handle_count: int, per_search: int) -> int:
     return max(10, min(handle_count, per_search))
 
@@ -400,11 +488,12 @@ def discover_status_urls(
     discovered: Dict[str, str] = {}
     backends = [backend] if backend != "auto" else list(DISCOVER_BACKENDS)
 
-    for name in backends:
+    for raw_name in backends:
+        name = "opencli-twitter" if raw_name == "opencli" else raw_name
         try:
             if name == "syndication":
                 urls = discover_urls_syndication(handles, cutoff_date, timeout, require_actionable=require_actionable)
-            elif name == "opencli":
+            elif name == "opencli-twitter":
                 urls = discover_urls_opencli(
                     handles,
                     after,
@@ -414,17 +503,27 @@ def discover_status_urls(
                     cutoff_date,
                     require_actionable=require_actionable,
                 )
+            elif name == "opencli-google":
+                urls = discover_urls_opencli_google(
+                    handles,
+                    after,
+                    batch_size,
+                    per_search,
+                    lang,
+                    cutoff_date,
+                    require_actionable=require_actionable,
+                )
             else:
-                raise ValueError(f"unsupported discover backend: {name}")
+                raise ValueError(f"unsupported discover backend: {raw_name}")
         except (FileNotFoundError, requests.RequestException, subprocess.CalledProcessError, ValueError) as exc:
-            log(f"warn: discover backend {name} failed: {exc}")
+            log(f"warn: discover backend {raw_name} failed: {exc}")
             urls = []
 
         before = len(discovered)
         for url in dedupe_urls(urls):
             discovered.setdefault(url, name)
         added = len(discovered) - before
-        log(f"discover backend {name} added {added} urls (total={len(discovered)})")
+        log(f"discover backend {raw_name} added {added} urls (total={len(discovered)})")
 
         if backend == "auto" and len(discovered) >= target_urls:
             break
@@ -620,18 +719,18 @@ def main() -> None:
         "--batch-size",
         type=int,
         default=10,
-        help="Legacy knob kept for CLI compatibility; current discover backends ignore it.",
+        help="Handle batch size for opencli-google discovery.",
     )
     parser.add_argument("--per-search", type=int, default=20)
     parser.add_argument("--outdir", default=str(Path.cwd() / "output"))
     parser.add_argument(
         "--lang",
         default="en",
-        help="Legacy knob kept for CLI compatibility; current discover backends ignore it.",
+        help="Language passed to opencli-google discovery.",
     )
     parser.add_argument(
         "--discover-backend",
-        choices=("auto", "syndication", "opencli", "none"),
+        choices=("auto", "syndication", "opencli", "opencli-google", "opencli-twitter", "none"),
         default="auto",
     )
     parser.add_argument(

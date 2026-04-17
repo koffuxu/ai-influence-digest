@@ -9,16 +9,21 @@
 ## ✅ 前提与约束（强制）
 - **绝对禁止使用 X API**（包括任何 X API 搜索/时间线拉取）。
 - 只允许走“公开网页 + 已登录浏览器会话复用”路径：
-  - 默认发现：`opencli twitter search`（只读）
+  - 默认发现：`opencli google search`（只读）
+  - 可选发现：`opencli twitter search`（只读）
   - 默认正文抓取：X 官方 `oEmbed`
   - 回退发现/抓取：X 公共 `syndication`、`r.jina.ai`
 
 ## 依赖
 - Python 3.9+
 - `requests`（Python 包，见 `requirements.txt`）
-- `opencli`（默认发现后端）
+- `opencli`（默认发现后端，支持 google/twitter search）
 - Chrome + Browser Bridge extension + 已登录 X 的独立浏览器 Profile
 - 可选：`screenshot-generator`（用于把最终周报渲染成多页图片）
+
+运行环境要求（重要）：
+- 涉及 `opencli` 的发现阶段（`opencli google search` / `opencli twitter search`）必须在系统环境执行，不能在沙箱环境执行。
+- 原因是 `opencli` 需要直接复用本机 Chrome Profile 与 Browser Bridge 扩展。
 
 ## 安装
 ```bash
@@ -32,7 +37,7 @@ npm install -g @jackwener/opencli
 建议：
 - 使用副号，不用主号
 - 给 `opencli` 单独建浏览器 Profile
-- 这个仓库只会调用只读命令 `opencli twitter search`
+- 这个仓库只会调用只读命令 `opencli google search` / `opencli twitter search`
 
 如果你要生成截图，建议把 `screenshot-generator` 作为同仓库的 `tools/screenshot-generator`、上级目录的 `tools/screenshot-generator`，或通过环境变量显式指定：
 
@@ -54,11 +59,12 @@ python3 scripts/scan_x_weekly.py \
 - `candidates.md`（便于人工快速扫读）
 
 默认行为：
-- `discover-backend=auto`：优先尝试 `opencli`，失败或结果不足时回退到 `syndication`
+- `discover-backend=auto`：优先尝试 `opencli-google`，不足时回退 `opencli-twitter`，最后回退 `syndication`
 - `fetch-backend=auto`：优先尝试 `oembed`，失败时回退到 `r.jina.ai`
 
 说明：
-- `opencli` 使用已登录浏览器会话在 X 内搜索公开帖子，发现能力更强
+- `opencli google search` 兼容性更高，适合做默认发现
+- `opencli twitter search` 对部分账号/时间窗口召回更强，可作为补充发现
 - `syndication` 不需要登录或插件，但对少数账号可能返回偏旧或不完整的时间线，所以只保留为回退
 
 显式指定后端：
@@ -66,7 +72,7 @@ python3 scripts/scan_x_weekly.py \
 ```bash
 python3 scripts/scan_x_weekly.py \
   --accounts references/accounts_65.txt \
-  --discover-backend opencli \
+  --discover-backend opencli-twitter \
   --fetch-backend oembed \
   --outdir ./output/ai-influence-digest
 ```
