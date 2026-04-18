@@ -9,10 +9,9 @@
 ## ✅ 前提与约束（强制）
 - **绝对禁止使用 X API**（包括任何 X API 搜索/时间线拉取）。
 - 只允许走“公开网页 + 已登录浏览器会话复用”路径：
-  - 默认发现：`opencli google search`（只读）
-  - 可选发现：`opencli twitter search`（只读）
-  - 默认正文抓取：X 官方 `oEmbed`
-  - 回退发现/抓取：X 公共 `syndication`、`r.jina.ai`
+  - 发现：`opencli google search` / `opencli twitter search`（只读，按场景选择）
+  - 正文抓取：X 官方 `oEmbed`（oEmbed 失败时跳过并记录 warn 日志）
+  - 兜底发现：X 公共 `syndication`（无需登录，但时间线可能不完整）
 
 ## 依赖
 - Python 3.9+
@@ -36,8 +35,14 @@ npm install -g @jackwener/opencli
 再安装 `opencli` 的 Browser Bridge 扩展，并用单独的 Chrome Profile 登录 X。
 建议：
 - 使用副号，不用主号
-- 给 `opencli` 单独建浏览器 Profile
+- 给 `opencli` 单独建浏览器 Profile（仅用于 `opencli-twitter`；`opencli-google` 不依赖 X 登录）
 - 这个仓库只会调用只读命令 `opencli google search` / `opencli twitter search`
+
+在 `~/.zshrc` 中配置 Chrome Profile 名称，脚本启动时会打印确认：
+
+```bash
+export OPENCLI_CHROME_PROFILE=<your-alt-account-profile-name>
+```
 
 如果你要生成截图，建议把 `screenshot-generator` 作为同仓库的 `tools/screenshot-generator`、上级目录的 `tools/screenshot-generator`，或通过环境变量显式指定：
 
@@ -60,12 +65,17 @@ python3 scripts/scan_x_weekly.py \
 
 默认行为：
 - `discover-backend=auto`：优先尝试 `opencli-google`，不足时回退 `opencli-twitter`，最后回退 `syndication`
-- `fetch-backend=auto`：优先尝试 `oembed`，失败时回退到 `r.jina.ai`
+- `fetch-backend=auto`：使用 X 官方 `oEmbed`；失败时跳过并记录 warn 日志
 
-说明：
-- `opencli google search` 兼容性更高，适合做默认发现
-- `opencli twitter search` 对部分账号/时间窗口召回更强，可作为补充发现
-- `syndication` 不需要登录或插件，但对少数账号可能返回偏旧或不完整的时间线，所以只保留为回退
+后端选择建议：
+
+| 场景 | 推荐 `--discover-backend` |
+|---|---|
+| 日报 / 近1-2天 | `opencli-twitter` |
+| 周报 / 7天（默认） | `auto` |
+| 账号安全优先、时效性要求不高 | `opencli-google` |
+
+注意：`opencli-google` 对 X 推文的索引有 **1-3 天延迟**，1天窗口基本搜不到内容；即使是7天窗口，部分低频或个人账号也可能未被索引。`opencli-twitter` 直接拦截 X 内部 API，时效性好但需要已登录的 X 副号。
 
 显式指定后端：
 
