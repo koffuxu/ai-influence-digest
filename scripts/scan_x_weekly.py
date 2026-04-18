@@ -41,7 +41,7 @@ EXCLUDE_HINTS = [
     "acquisition",
 ]
 DISCOVER_BACKENDS = ("opencli-google", "opencli-twitter", "syndication")
-FETCH_BACKENDS = ("oembed", "jina")
+FETCH_BACKENDS = ("oembed",)
 DEFAULT_TIMEOUT = 30
 STATUS_RE = re.compile(r"https?://(?:www\.)?(?:x|twitter)\.com/([^/]+)/status/(\d+)", re.IGNORECASE)
 STATUS_ID_RE = re.compile(
@@ -576,88 +576,13 @@ def fetch_tweet_oembed(status_url: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[
     return info
 
 
-def extract_jina_text(raw_text: str) -> str:
-    idx = raw_text.find("## Conversation")
-    if idx == -1:
-        idx = raw_text.find("# Conversation")
-    body = raw_text[idx:] if idx != -1 else raw_text
-
-    lines = [line.strip() for line in body.splitlines()]
-    out_lines: List[str] = []
-    started = False
-    for line in lines:
-        if line in ("## Conversation", "# Conversation"):
-            started = True
-            continue
-        if not started and idx != -1:
-            continue
-        if line.startswith("Quote") or line.startswith("## New to X") or line.startswith("Sign up"):
-            break
-        if line.startswith("[") and "Views" in line:
-            break
-        if not line:
-            if out_lines and out_lines[-1] != "":
-                out_lines.append("")
-            continue
-        if line.lower() in ("post", "conversation", "see new posts"):
-            continue
-        out_lines.append(line)
-
-    cleaned = clean_extracted_text("\n".join(out_lines))
-    if len(cleaned) >= 40:
-        return cleaned
-
-    fallback_lines = []
-    for line in raw_text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith(("Title:", "URL Source:", "Markdown Content:")):
-            continue
-        fallback_lines.append(stripped)
-        if len(" ".join(fallback_lines)) >= 800:
-            break
-    return clean_extracted_text("\n".join(fallback_lines))
-
-
-def fetch_tweet_jina(status_url: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, str | None]:
-    response = requests.get("https://r.jina.ai/" + status_url, timeout=timeout)
-    response.raise_for_status()
-    raw_text = response.text
-    text = extract_jina_text(raw_text)
-    if not text:
-        raise ValueError("jina text extraction failed")
-
-    published_date = None
-    for line in raw_text.splitlines():
-        if line.startswith("Published Time:"):
-            published_date = parse_dateish(line.split(":", 1)[1].strip())
-            break
-
-    return {
-        "text": text,
-        "author_name": None,
-        "published_date": published_date.isoformat() if published_date else None,
-        "canonical_url": status_url,
-        "backend": "jina",
-    }
-
 def fetch_tweet_info(status_url: str, backend: str, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, str | None]:
-    backends = [backend] if backend != "auto" else list(FETCH_BACKENDS)
-    errors: List[str] = []
-
-    for name in backends:
-        try:
-            if name == "oembed":
-                return fetch_tweet_oembed(status_url, timeout=timeout)
-            if name == "jina":
-                return fetch_tweet_jina(status_url, timeout=timeout)
-            raise ValueError(f"unsupported fetch backend: {name}")
-        except (FileNotFoundError, requests.RequestException, subprocess.CalledProcessError, ValueError) as exc:
-            errors.append(f"{name}: {exc}")
-            continue
-
-    raise RuntimeError("; ".join(errors) or "no fetch backends available")
+    if backend not in ("auto", "oembed"):
+        raise ValueError(f"unsupported fetch backend: {backend}")
+    try:
+        return fetch_tweet_oembed(status_url, timeout=timeout)
+    except (requests.RequestException, ValueError) as exc:
+        raise RuntimeError(f"oembed: {exc}") from exc
 
 
 def load_handles(accounts_path: Path) -> List[str]:
@@ -736,7 +661,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--fetch-backend",
-        choices=("auto", "oembed", "jina"),
+        choices=("auto", "oembed"),
         default="auto",
     )
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
